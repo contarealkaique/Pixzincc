@@ -2,45 +2,55 @@
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 const { PeerServer } = require('peer');
-const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-
+const fs = require('fs');
+const path = require('path');
 
 const DATA_DIR = process.env.DATA_DIR || '/var/data';
-const fs = require('fs');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new Database(process.env.DB_PATH || `${DATA_DIR}/pixzin.sqlite`);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
- id TEXT PRIMARY KEY, username TEXT NOT NULL, username_key TEXT NOT NULL UNIQUE,
- password_hash TEXT NOT NULL, points INTEGER NOT NULL DEFAULT 0, credits INTEGER NOT NULL DEFAULT 1000,
- wins INTEGER NOT NULL DEFAULT 0, inventory TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS sessions (
- token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- expires_at INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS transactions (
- id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL REFERENCES users(id),
- kind TEXT NOT NULL, amount INTEGER NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-`);
+const DATA_FILE = process.env.DATA_FILE || path.join(DATA_DIR, 'accounts.json');
+const MAX_ACCOUNTS = Math.max(1, Math.min(5000, Number(process.env.MAX_ACCOUNTS || 500)));
+fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+function emptyStore(){ return { version:1, users:[], sessions:[], transactions:[] }; }
+function loadStore(){
+  try {
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (!parsed || !Array.isArray(parsed.users) || !Array.isArray(parsed.sessions) || !Array.isArray(parsed.transactions)) throw new Error('Formato inválido');
+    return parsed;
+  } catch (e) {
+    if (e.code === 'ENOENT') { const initial=emptyStore(); fs.writeFileSync(DATA_FILE, JSON.stringify(initial), {mode:0o600}); return initial; }
+    throw new Error(`Não foi possível ler o arquivo persistente ${DATA_FILE}: ${e.message}`);
+  }
+}
+let store = loadStore();
+let writeChain = Promise.resolve();
+function persistStore(){
+  const temp = `${DATA_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(store), {mode:0o600});
+  fs.renameSync(temp, DATA_FILE);
+}
+function persist(){
+  // Single Node process: synchronous atomic replacement prevents partially-written JSON.
+  persistStore();
+}
 const tokenHash = t => crypto.createHash('sha256').update(String(t)).digest('hex');
-const publicUser = u => ({ id:u.id, username:u.username, points:u.points, credits:u.credits, wins:u.wins, inventory:JSON.parse(u.inventory || '[]'), createdAt:u.created_at });
+const publicUser = u => ({ id:u.id, username:u.username, points:u.points, credits:u.credits, wins:u.wins, inventory:Array.isArray(u.inventory)?u.inventory:[], createdAt:u.created_at });
 function getUserByToken(token) {
- if (!token || typeof token !== 'string' || token.length > 200) return null;
- const row=db.prepare('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?').get(tokenHash(token),Date.now());
- return row || null;
+  if (!token || typeof token !== 'string' || token.length > 200) return null;
+  const session = store.sessions.find(s => s.token_hash === tokenHash(token) && s.expires_at > Date.now());
+  if (!session) return null;
+  return store.users.find(u => u.id === session.user_id) || null;
 }
 function issueToken(userId) {
- const token=crypto.randomBytes(32).toString('base64url');
- db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)').run(tokenHash(token),userId,Date.now()+1000*60*60*24*30);
- return token;
+  const token=crypto.randomBytes(32).toString('base64url');
+  store.sessions = store.sessions.filter(s => s.expires_at > Date.now());
+  store.sessions.push({token_hash:tokenHash(token),user_id:userId,expires_at:Date.now()+1000*60*60*24*30,created_at:new Date().toISOString()});
+  persist();
+  return token;
 }
+function findUserByNameKey(key){ return store.users.find(u=>u.username_key===key) || null; }
+function addUser(user){ if(store.users.length>=MAX_ACCOUNTS) return false; if(findUserByNameKey(user.username_key)) return false; store.users.push(user); store.transactions.push({id:crypto.randomUUID(),user_id:user.id,kind:'welcome',amount:1000,note:'Saldo inicial',created_at:new Date().toISOString()}); persist(); return true; }
+function updateUser(id, patch){ const u=store.users.find(x=>x.id===id); if(!u)return null; Object.assign(u,patch,{updated_at:new Date().toISOString()}); persist(); return u; }
 function json(res,status,data) { res.writeHead(status, {'content-type':'application/json; charset=utf-8','cache-control':'no-store','access-control-allow-origin':process.env.SITE_ORIGIN || '*','access-control-allow-headers':'content-type,authorization','access-control-allow-methods':'GET,POST,OPTIONS'});res.end(JSON.stringify(data));}
 
 const PORT = Number(process.env.PORT || 3000);
@@ -104,7 +114,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { json(res,204,{}); return; }
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (url.pathname === '/' || url.pathname === '/health') {
-    json(res,200,{service:'pixzin-vegas',status:'ok',database:'sqlite',online:nicknames.size,waiting:queue.length}); return;
+    json(res,200,{service:'pixzin-vegas',status:'ok',storage:'json-file',accounts:store.users.length,accountLimit:MAX_ACCOUNTS,online:nicknames.size,waiting:queue.length}); return;
   }
   if (url.pathname.startsWith('/api/')) {
     let body='';
@@ -116,14 +126,16 @@ const server = http.createServer((req, res) => {
       if(req.method==='POST' && url.pathname==='/api/register'){
         if(username.length<3 || !/^[\p{L}\p{N}_ -]+$/u.test(username)){json(res,400,{error:'Use de 3 a 18 caracteres: letras, números, espaço, hífen ou sublinhado.'});return;}
         if(typeof data.password!=='string' || data.password.length<10 || data.password.length>128){json(res,400,{error:'A senha deve ter de 10 a 128 caracteres.'});return;}
-        if(db.prepare('SELECT id FROM users WHERE username_key=?').get(key)){json(res,409,{error:'Esse nome de usuário já existe. Faça login ou escolha outro.'});return;}
-        const id=crypto.randomUUID(), hash=bcrypt.hashSync(data.password,12);
-        try { db.prepare('INSERT INTO users(id,username,username_key,password_hash) VALUES(?,?,?,?)').run(id,username,key,hash); db.prepare('INSERT INTO transactions(user_id,kind,amount,note) VALUES(?,?,?,?)').run(id,'welcome',1000,'Saldo inicial'); }
-        catch(e){json(res,409,{error:'Não foi possível criar a conta. Tente outro nome.'});return;}
-        const user=db.prepare('SELECT * FROM users WHERE id=?').get(id);json(res,201,{token:issueToken(id),user:publicUser(user)});return;
+        if(findUserByNameKey(key)){json(res,409,{error:'Esse nome de usuário já existe. Faça login ou escolha outro.'});return;}
+        if(store.users.length>=MAX_ACCOUNTS){json(res,507,{error:`O limite de ${MAX_ACCOUNTS} contas foi atingido.`});return;}
+        const id=crypto.randomUUID(), hash=bcrypt.hashSync(data.password,12), now=new Date().toISOString();
+        const user={id,username,username_key:key,password_hash:hash,points:0,credits:1000,wins:0,inventory:[],created_at:now,updated_at:now};
+        try { if(!addUser(user)){json(res,409,{error:'Não foi possível criar a conta. Tente outro nome.'});return;} }
+        catch(e){json(res,500,{error:'Não foi possível salvar a conta. Verifique o disco persistente do servidor.'});return;}
+        json(res,201,{token:issueToken(id),user:publicUser(user)});return;
       }
       if(req.method==='POST' && url.pathname==='/api/login'){
-        const user=db.prepare('SELECT * FROM users WHERE username_key=?').get(key);
+        const user=findUserByNameKey(key);
         if(!user || typeof data.password!=='string' || !bcrypt.compareSync(data.password,user.password_hash)){json(res,401,{error:'Usuário ou senha incorretos.'});return;}
         json(res,200,{token:issueToken(user.id),user:publicUser(user)});return;
       }
@@ -133,16 +145,35 @@ const server = http.createServer((req, res) => {
         if(!user){json(res,401,{error:'Sessão expirada. Entre novamente.'});return;}json(res,200,{user:publicUser(user)});return;
       }
       if(!user){json(res,401,{error:'Faça login novamente.'});return;}
-      if(url.pathname==='/api/logout' && req.method==='POST'){db.prepare('DELETE FROM sessions WHERE token_hash=?').run(tokenHash(auth));json(res,200,{ok:true});return;}
+      if(url.pathname==='/api/logout' && req.method==='POST'){store.sessions=store.sessions.filter(s=>s.token_hash!==tokenHash(auth));persist();json(res,200,{ok:true});return;}
       if(url.pathname==='/api/profile' && req.method==='POST'){
         const points=Math.max(0,Math.min(1000000000,Math.floor(Number(data.points)||0)));
         const wins=Math.max(0,Math.min(10000000,Math.floor(Number(data.wins)||0)));
         // Client-reported scores are capped; economy-changing transactions must be server-validated in production.
-        db.prepare('UPDATE users SET points=MAX(points,?), wins=MAX(wins,?), updated_at=CURRENT_TIMESTAMP WHERE id=?').run(points,wins,user.id);
-        json(res,200,{user:publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(user.id))});return;
+        updateUser(user.id,{points:Math.max(user.points,points),wins:Math.max(user.wins,wins)});
+        json(res,200,{user:publicUser(store.users.find(u=>u.id===user.id))});return;
+      }
+      if(url.pathname==='/api/777' && req.method==='POST'){
+        if(!user){json(res,401,{error:'Faça login novamente.'});return;}
+        const question=String(data.question||'').trim().slice(0,500);
+        if(String(data.passcode||'')!=='777'){json(res,403,{error:'A senha não abriu o portal.'});return;}
+        if(question.length<3){json(res,400,{error:'Escreva uma pergunta para o gnomo.'});return;}
+        const nowMs=Date.now();
+        if(Number(user.secret777_at)>0 && nowMs-Number(user.secret777_at)<24*60*60*1000){const next=Number(user.secret777_at)+24*60*60*1000;json(res,429,{error:'O portal já respondeu sua pergunta. Volte após 24 horas.',nextAt:next});return;}
+        // Uma consulta diária por conta; resposta e saldo são decididos no servidor e persistidos.
+        const positive=Math.random()<0.5;
+        const gain=positive?250:150;
+        const answer=positive
+          ? ['O gnomo fareja bons ventos no seu caminho. Dê o próximo passo com coragem, mas mantenha os olhos abertos.','As folhas antigas sussurram um sim. A sorte favorece quem age com calma e intenção.','Uma pequena porta se abre diante de você. Aproveite a oportunidade sem esquecer seus aliados.'][crypto.randomInt(0,3)]
+          : ['O gnomo ouviu sua pergunta, mas a névoa ainda cobre o caminho. Espere, observe e não force a resposta.','Hoje as estrelas pedem cautela. Nem todo não é derrota; às vezes é um desvio que protege você.','O vento virou contra a sua vela. Guarde energia, aprenda com os sinais e tente novamente amanhã.'][crypto.randomInt(0,3)];
+        const before=Math.max(0,Number(user.credits)||0);
+        const after=positive?Math.min(1000000000,before+gain):Math.max(0,before-gain);
+        updateUser(user.id,{credits:after,secret777_at:nowMs});
+        store.transactions.push({id:crypto.randomUUID(),user_id:user.id,kind:'secret777',amount:after-before,note:'Oráculo 777',created_at:new Date().toISOString()});persist();
+        json(res,200,{answer,positive,delta:after-before,credits:after,nextAt:Date.now()+24*60*60*1000});return;
       }
       if(url.pathname==='/api/ranking' && req.method==='GET'){
-        const players=db.prepare('SELECT username,points,credits,wins FROM users ORDER BY points DESC,wins DESC LIMIT 100').all();
+        const players=[...store.users].sort((a,b)=>b.points-a.points||b.wins-a.wins).slice(0,100).map(u=>({username:u.username,points:u.points,credits:u.credits,wins:u.wins}));
         json(res,200,{players});return;
       }
       json(res,404,{error:'Rota não encontrada.'});
@@ -198,7 +229,7 @@ wss.on('connection', (ws, req) => {
       session.points = Math.max(0, Math.min(100000000, Math.floor(Number(msg.points) || 0)));
       session.wins = Math.max(0, Math.min(1000000, Math.floor(Number(msg.wins) || 0)));
       session.credits = Math.max(0, Math.min(100000000, Math.floor(Number(msg.credits) || 0)));
-      if(session.userId) db.prepare('UPDATE users SET points=MAX(points,?), wins=MAX(wins,?), credits=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(session.points,session.wins,session.credits,session.userId);
+      if(session.userId) { const account=store.users.find(u=>u.id===session.userId); if(account){account.points=Math.max(account.points,session.points);account.wins=Math.max(account.wins,session.wins);account.credits=session.credits;account.updated_at=new Date().toISOString();persist();} }
       broadcastPresence();
       return;
     }

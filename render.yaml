@@ -1,12 +1,12 @@
 services:
   - type: web
-    name: pixzin-vegas
+    name: pixzin
     runtime: node
     rootDir: server
     buildCommand: npm install
     startCommand: npm start
     disk:
-      name: pixzin-data
+      name: pixzin-accounts-data
       mountPath: /var/data
       sizeGB: 1
     envVars:
@@ -14,5 +14,9 @@ services:
         value: 20
       - key: DATA_DIR
         value: /var/data
+      - key: DATA_FILE
+        value: /var/data/accounts.json
+      - key: MAX_ACCOUNTS
+        value: 500
       - key: SITE_ORIGIN
         sync: false
