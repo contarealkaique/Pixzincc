@@ -61,9 +61,9 @@ DIAGNÓSTICO DO ERRO “FAILED TO FETCH” E DO REPOSITÓRIO pixzincc (29/10/202
 7. O botão flutuante de WhatsApp foi removido; ações contextuais de compartilhar/enviar dentro do jogo continuam disponíveis.
 
 
-RECURSO SECRETO 777
-- O jogo 777 aparece apenas ao pesquisar exatamente “777” na lista de jogos. A senha não é exibida na interface.
-- Uma pergunta diária por conta é validada no backend e registrada no arquivo JSON persistente.
-- A resposta do gnomo é gerada no servidor; o resultado sorteia ganho ou perda de fichas fictícias e o saldo atualizado é salvo.
-- Requer publicar a versão atualizada do backend e do frontend. A regra diária usa o dia UTC no servidor; não é uma garantia exata de 24 horas após a consulta.
-- As fichas são virtuais e sem valor monetário. O resultado é aleatório, não aconselhamento nem previsão real.
+CORREÇÃO DE DEPLOY RENDER (29/10/2026)
+- A configuração do caminho do arquivo JSON agora valida o diretório antes de iniciar.
+- Para Render, mantenha Root Directory = server, Build Command = npm install, Start Command = npm start.
+- Configure DATA_DIR=/var/data e DATA_FILE=/var/data/accounts.json.
+- O serviço precisa ter um Persistent Disk montado em /var/data. Sem disco persistente, os dados podem se perder em novo deploy.
+- A linha de configuração isolada é JavaScript válido; se o Render continuar apontando para a linha 11, confirme se o deploy está usando este arquivo e envie o log completo para localizar a causa exata.
