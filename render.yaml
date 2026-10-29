@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: pixzin-vegas
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    disk:
+      name: pixzin-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATA_DIR
+        value: /var/data
+      - key: SITE_ORIGIN
+        sync: false
